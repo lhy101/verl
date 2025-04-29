@@ -1,7 +1,7 @@
 source /jizhicfs/lhy/env/verl_H20.sh
 
 HOME=/jizhicfs/lhy
-MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-3B-Instruct
+MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-7B-Instruct
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
@@ -48,9 +48,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='lhy_exp' \
-    trainer.experiment_name='profile_Qwen_3b_4k' \
+    trainer.experiment_name='profile_Qwen_7b_4k' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=8 \
     trainer.save_freq=30 \
     trainer.test_freq=10 \
-    trainer.total_epochs=30 2>&1 | tee Qwen_3b_4k.log
+    trainer.total_epochs=30 2>&1 | tee Qwen_7b_4k.log
