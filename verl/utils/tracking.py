@@ -41,6 +41,7 @@ class Tracking:
         if "tracking" in default_backend or "wandb" in default_backend:
             import wandb
 
+            wandb.login(key="f2d75d0c263e3dac7127355c812c8567f4599373")
             wandb.init(project=project_name, name=experiment_name, config=config)
             self.logger["wandb"] = wandb
 

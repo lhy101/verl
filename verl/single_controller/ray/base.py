@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import ray
+import os
 from ray.experimental.state.api import get_actor
 from ray.util import list_named_actors
 from ray.util.placement_group import PlacementGroup, placement_group
@@ -264,6 +265,7 @@ class RayWorkerGroup(WorkerGroup):
                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
                     "RAY_LOCAL_RANK": str(local_rank),
                 }
+
                 if rank != 0:
                     env_vars["MASTER_ADDR"] = self._master_addr
                     env_vars["MASTER_PORT"] = self._master_port
@@ -275,7 +277,19 @@ class RayWorkerGroup(WorkerGroup):
                 cia_name = match.group(1) if match else cia_name  # "ActorClass(Obj)" -> "Obj"
                 name = f"{self.name_prefix}{cia_name}_{pg_idx}:{local_rank}"  # e.g. Worker_2:5
 
-                ray_cls_with_init.update_options({"runtime_env": {"env_vars": env_vars}, "name": name})
+                nsight_vars = {
+                    "t": "cuda,cudnn,cublas",
+                    "cuda-memory-usage": "true",
+                    "cuda-graph-trace": "graph",
+                    "o": f"/jizhicfs/trace/{name}.nsys-rep"
+                }
+
+                if 'verl_nsys_profile' in os.environ:
+                    # print(f"{name} uses nsys profiler")
+                    ray_cls_with_init.update_options({"runtime_env": {"env_vars": env_vars, "nsight": nsight_vars}, "name": name})
+                else:
+                    # print(f"{name} does not use nsys profiler")
+                    ray_cls_with_init.update_options({"runtime_env": {"env_vars": env_vars}, "name": name})
 
                 if detached:
                     ray_cls_with_init.update_options({"lifetime": "detached"})

@@ -24,6 +24,7 @@ import torch.distributed
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.autograd.profiler import record_function
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
@@ -234,7 +235,8 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     response_mask = attention_mask[:, -response_length - 1 : -1]
 
-                    vpreds = self._forward_micro_batch(data)
+                    with record_function("## forward ##"):
+                        vpreds = self._forward_micro_batch(data)
 
                     # assert not torch.any(torch.isnan(vpreds)).item()
 
@@ -251,7 +253,8 @@ class DataParallelPPOCritic(BasePPOCritic):
                     else:
                         loss = vf_loss / self.gradient_accumulation
 
-                    loss.backward()
+                    with record_function("## backward ##"):
+                        loss.backward()
 
                     data = {
                         "critic/vf_loss": vf_loss.detach().item(),
@@ -261,7 +264,8 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     append_to_dict(metrics, data)
 
-                grad_norm = self._optimizer_step()
+                with record_function("## optimizer ##"):
+                    grad_norm = self._optimizer_step()
                 data = {"critic/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.critic_optimizer.zero_grad()

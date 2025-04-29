@@ -24,6 +24,7 @@ import torch
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.autograd.profiler import record_function
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -339,17 +340,18 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
+                    with record_function("## forward ##"):
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -378,7 +380,8 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                    with record_function("## backward ##"):
+                        loss.backward()
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
@@ -388,7 +391,8 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, data)
 
-                grad_norm = self._optimizer_step()
+                with record_function("## optimizer ##"):
+                    grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()

@@ -25,6 +25,7 @@ import torch.distributed
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from torch.distributed.device_mesh import init_device_mesh
+from torch.autograd.profiler import record_function
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -35,6 +36,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.profiler import _torch_profiler
 from verl.utils.fsdp_utils import (
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
@@ -498,80 +500,96 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
-        # Support all hardwares
-        data = data.to(torch.cuda.current_device())
+        with _torch_profiler(file_prefix="update_policy") as prof:
+            # Support all hardwares
+            data = data.to(torch.cuda.current_device())
 
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+            with record_function("## load actor param and optimizer ##"):
+                assert self._is_actor
+                if self._is_offload_param:
+                    load_fsdp_model_to_gpu(self.actor_module_fsdp)
+                if self._is_offload_optimizer:
+                    load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data=data)
-            # perform training
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data=data)
+                # perform training
+                with Timer(name="update_policy", logger=None) as timer:
+                    metrics = self.actor.update_policy(data=data)
+                delta_time = timer.last
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/actor"] = (
+                    estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                )
+                metrics["perf/max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
+                metrics["perf/max_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / (1024**3)
+                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            self.actor_lr_scheduler.step()
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
+                self.actor_lr_scheduler.step()
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr
 
-            # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
+                # TODO: here, we should return all metrics
+                output = DataProto(meta_info={"metrics": metrics})
 
-            output = self.ulysses_sharding_manager.postprocess_data(data=output)
-            output = output.to("cpu")
+                output = self.ulysses_sharding_manager.postprocess_data(data=output)
+                output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            with record_function("## offload actor param and optimizer ##"):
+                if self._is_offload_param:
+                    offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                if self._is_offload_optimizer:
+                    offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            
+            if prof is not None:
+                prof.step()
 
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
-        # Support all hardwares
-        prompts = prompts.to(torch.cuda.current_device())
+        with _torch_profiler(file_prefix="generate_sequences", profile_time=False) as prof:
+            # Support all hardwares
+            prompts = prompts.to(torch.cuda.current_device())
 
-        assert self._is_rollout
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with record_function("## load actor param ##"):
+                assert self._is_rollout
+                if self._is_offload_param:
+                    load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-        }
-        prompts.meta_info.update(meta_info)
-        with self.rollout_sharding_manager:
-            # after parameters sync with rollout, offload actor model to CPU
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            meta_info = {
+                "eos_token_id": self.generation_config.eos_token_id
+                if self.generation_config is not None
+                else self.tokenizer.eos_token_id,
+                "pad_token_id": self.generation_config.pad_token_id
+                if self.generation_config is not None
+                else self.tokenizer.pad_token_id,
+            }
+            prompts.meta_info.update(meta_info)
+            with self.rollout_sharding_manager:
 
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
-            output = self.rollout_sharding_manager.postprocess_data(output)
+                with record_function("## offload actor param and optimizer ##"):
+                    # after parameters sync with rollout, offload actor model to CPU
+                    if self._is_offload_param:
+                        offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                    if self._is_offload_optimizer:
+                        offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
-        output = output.to("cpu")
+                prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                with record_function("## actor rollout ##"):
+                    output = self.rollout.generate_sequences(prompts=prompts)
+                output = self.rollout_sharding_manager.postprocess_data(output)
 
-        # clear kv cache
-        torch.cuda.empty_cache()
+            output = output.to("cpu")
+
+            # clear kv cache
+            with record_function("## clear kv cache ##"):
+                torch.cuda.empty_cache()
+
+            if prof is not None:
+                prof.step()
+
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -910,38 +928,47 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
-        # Support all hardwares
-        data = data.to(torch.cuda.current_device())
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.critic_module)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
+        with _torch_profiler(file_prefix="update_critic") as prof:
+            # Support all hardwares
+            data = data.to(torch.cuda.current_device())
 
-        # perform forward computation
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            with record_function("## load critic param and optimizer ##"):
+                if self._is_offload_param:
+                    load_fsdp_model_to_gpu(self.critic_module)
+                if self._is_offload_optimizer:
+                    load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
 
-            with Timer(name="update_critic", logger=None) as timer:
-                metrics = self.critic.update_critic(data=data)
-            delta_time = timer.last
+            # perform forward computation
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data=data)
 
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+                with Timer(name="update_critic", logger=None) as timer:
+                    metrics = self.critic.update_critic(data=data)
 
-            self.critic_lr_scheduler.step()
-            lr = self.critic_lr_scheduler.get_last_lr()[0]
-            metrics["critic/lr"] = lr
+                delta_time = timer.last
 
-            output = DataProto(batch=None, meta_info={"metrics": metrics})
-            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.critic_module)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+                self.critic_lr_scheduler.step()
+                lr = self.critic_lr_scheduler.get_last_lr()[0]
+                metrics["critic/lr"] = lr
 
-        output = output.to("cpu")
+                output = DataProto(batch=None, meta_info={"metrics": metrics})
+                output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+            with record_function("## offload actor param and optimizer ##"):
+                if self._is_offload_param:
+                    offload_fsdp_model_to_cpu(self.critic_module)
+                if self._is_offload_optimizer:
+                    offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+
+            output = output.to("cpu")
+
+            if prof is not None:
+                prof.step()
+
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
