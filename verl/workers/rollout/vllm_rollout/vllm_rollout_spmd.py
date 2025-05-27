@@ -143,7 +143,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
+            seed=config.get("seed", 42),
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -263,11 +263,23 @@ class vLLMRollout(BaseRollout):
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
             response = []
+            log_probs = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
+                    if self.config.enable_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                        # Directly use the list of floats returned by vLLM
+                        log_prob_list = []
+                        for log_prob in output.outputs[sample_id].logprobs:
+                            log_prob_list.append(next(iter(log_prob.values())).logprob)
+                        log_probs.append(log_prob_list)
+                    else:
+                        log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+            if self.config.enable_log_prob:
+                log_probs = pad_2d_list_to_length(log_probs, 0.0,
+                                                max_length=self.config.response_length).to(idx.device)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)
@@ -306,6 +318,8 @@ class vLLMRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
+        if self.config.enable_log_prob:
+            batch['old_log_probs'] = log_probs
 
         # free vllm cache engine
         if (

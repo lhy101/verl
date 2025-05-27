@@ -73,25 +73,29 @@ def unpad_dataproto(data: "DataProto", pad_size):
     return data
 
 
-def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
+def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict, overwrite: bool = False) -> TensorDict:
     """Union two tensordicts."""
     assert tensor_dict1.batch_size == tensor_dict2.batch_size, f"Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}"
     for key in tensor_dict2.keys():
-        if key not in tensor_dict1.keys():
+        if overwrite:
             tensor_dict1[key] = tensor_dict2[key]
         else:
-            assert tensor_dict1[key].equal(tensor_dict2[key]), f"{key} in tensor_dict1 and tensor_dict2 are not the same object"
+            if key not in tensor_dict1.keys():
+                tensor_dict1[key] = tensor_dict2[key]
+            else:
+                assert tensor_dict1[key].equal(tensor_dict2[key]), f"{key} in tensor_dict1 and tensor_dict2 are not the same object"
 
     return tensor_dict1
 
 
-def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str, np.ndarray], overwrite: bool = False) -> dict[str, np.ndarray]:
     for key, val in tensor_dict2.items():
-        if key in tensor_dict1:
-            assert isinstance(tensor_dict2[key], np.ndarray)
-            assert isinstance(tensor_dict1[key], np.ndarray)
-            # to properly deal with nan and object type
-            assert pd.DataFrame(tensor_dict2[key]).equals(pd.DataFrame(tensor_dict1[key])), f"{key} in tensor_dict1 and tensor_dict2 are not the same object"
+        if not overwrite:
+            if key in tensor_dict1:
+                assert isinstance(tensor_dict2[key], np.ndarray)
+                assert isinstance(tensor_dict1[key], np.ndarray)
+                # to properly deal with nan and object type
+                assert pd.DataFrame(tensor_dict2[key]).equals(pd.DataFrame(tensor_dict1[key])), f"{key} in tensor_dict1 and tensor_dict2 are not the same object"
         tensor_dict1[key] = val
 
     return tensor_dict1
@@ -535,7 +539,7 @@ class DataProto:
 
         return self
 
-    def union(self, other: "DataProto") -> "DataProto":
+    def union(self, other: "DataProto", overwrite: bool = False) -> "DataProto":
         """Union with another DataProto. Union batch and meta_info separately.
         Throw an error if
 
@@ -549,9 +553,9 @@ class DataProto:
         Returns:
             DataProto: the DataProto after union
         """
-        self.batch = union_tensor_dict(self.batch, other.batch)
-        self.non_tensor_batch = union_numpy_dict(self.non_tensor_batch, other.non_tensor_batch)
-        self.meta_info = union_two_dict(self.meta_info, other.meta_info)
+        self.batch = union_tensor_dict(self.batch, other.batch, overwrite=overwrite)
+        self.non_tensor_batch = union_numpy_dict(self.non_tensor_batch, other.non_tensor_batch, overwrite=overwrite)
+        self.meta_info = union_two_dict(self.meta_info, other.meta_info, overwrite=overwrite)
         return self
 
     def make_iterator(self, mini_batch_size, epochs, seed=None, dataloader_kwargs=None):

@@ -1,7 +1,7 @@
 #!/bin/bash
 source /jizhicfs/lhy/env/verl_H20.sh
 
-HOSTFILE=${1:-"/jizhicfs/lhy/hosts/node89101112131415"}
+HOSTFILE=${1:-"/jizhicfs/lhy/hosts/node03"}
 PORT=8888                # Ray节点通信端口
 DASHBOARD_PORT=8265      # Ray Dashboard端口
 
@@ -25,12 +25,14 @@ pssh -H "${HEAD_IP}" -i \
     ray start --head \
     --port=${PORT} \
     --dashboard-host=0.0.0.0 \
-    --dashboard-port=${DASHBOARD_PORT}"
+    --dashboard-port=${DASHBOARD_PORT} \
+    --num-cpus=32"
 
 # 启动Worker节点
 if [ ${#workers[@]} -gt 0 ]; then
     echo "Starting ${#workers[@]} Worker nodes"
     pssh -H "${workers[*]}" -i \
         "source /jizhicfs/lhy/env/verl_H20.sh && \
-        ray start --address=${HEAD_IP}:${PORT}"
+        ray start --address=${HEAD_IP}:${PORT} \
+        --num-cpus=32"
 fi

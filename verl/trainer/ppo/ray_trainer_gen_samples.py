@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import pickle
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -884,7 +885,17 @@ class RayPPOTrainer:
                         non_tensor_batch_keys=["raw_prompt_ids"] + ["raw_prompt"] if self.async_rollout_mode else [],
                     )
 
+                gen_batch.meta_info["do_sample"] = False
+
+                # 用old param进行一次generate
                 gen_batch.meta_info["step"] = self.global_steps
+                old_gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                old_input_ids = gen_batch.batch["input_ids"]
+                old_input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in old_input_ids]       
+                old_output_ids = old_gen_batch_output.batch["responses"]
+                old_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in old_output_ids]
+
+                gen_batch.meta_info["step"] = -1
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
@@ -896,6 +907,13 @@ class RayPPOTrainer:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+
+                    # 用current param进行generate
+                    cur_input_ids = gen_batch.batch["input_ids"]
+                    cur_input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in cur_input_ids]       
+                    cur_output_ids = gen_batch_output.batch["responses"]
+                    cur_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in cur_output_ids]
+                    gen_time = gen_batch_output.meta_info["gen_time"]
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
@@ -938,6 +956,10 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    
+                    batch.union(old_gen_batch_output, overwrite=True)
+                    old_on_new_old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                    batch.union(gen_batch_output, overwrite=True)
 
                     if self.config.actor_rollout_ref.rollout.enable_log_prob:
                         # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
@@ -957,6 +979,32 @@ class RayPPOTrainer:
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
+
+                    save_dir = "gen_samples"
+                    os.makedirs(save_dir, exist_ok=True)
+
+                    # 构建包含新旧生成数据的字典
+                    data_dict = {
+                        "old_input_ids": old_input_ids,
+                        "old_input_texts": old_input_texts,
+                        "old_output_ids": old_output_ids,
+                        "old_output_texts": old_output_texts,
+                        "old_on_old_log_prob": old_gen_batch_output.batch["old_log_probs"],
+                        "old_on_new_log_prob": old_on_new_old_log_prob.batch["old_log_probs"],
+                        "cur_input_ids": cur_input_ids,
+                        "cur_input_texts": cur_input_texts,
+                        "cur_output_ids": cur_output_ids,
+                        "cur_output_texts": cur_output_texts,
+                        # "cur_log_prob": old_log_prob.batch["old_log_probs"],
+                        "gen_time": gen_time
+                    }
+
+                    # 保存为pickle文件
+                    file_path = os.path.join(save_dir, f"step_{self.global_steps}.pkl")
+                    with open(file_path, "wb") as f:
+                        pickle.dump(data_dict, f)
+
+                    batch.union(old_gen_batch_output, overwrite=True)
 
                     if self.use_reference_policy:
                         # compute reference log_prob

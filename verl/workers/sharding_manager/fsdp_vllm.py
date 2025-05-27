@@ -26,7 +26,7 @@ from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from verl.utils.debug import GPUMemoryLogger, log_gpu_memory_usage
-from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+from verl.utils.fsdp_utils import save_model_replica, load_oldest_model_replica, delete_model_replica, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.torch_functional import check_cuda_is_available
 from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
@@ -46,6 +46,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         full_params: bool = False,
         device_mesh: DeviceMesh = None,
         offload_param: bool = False,
+        async_steps: int = -1,
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer intialized in vLLMAsyncRollout.load_model
@@ -54,12 +55,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.model_config = model_config
         self.device_mesh = device_mesh
         self.offload_param = offload_param
+        self.async_steps = async_steps
 
         # Full params
         self.full_params = full_params
         if full_params:
+            print("FSDP-VLLM uses full params sharding")
             FSDP.set_state_dict_type(self.module, state_dict_type=StateDictType.FULL_STATE_DICT, state_dict_config=FullStateDictConfig())
         else:
+            print("FSDP-VLLM does not use full params sharding")
             FSDP.set_state_dict_type(
                 self.module,
                 state_dict_type=StateDictType.SHARDED_STATE_DICT,
@@ -91,10 +95,22 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
         torch.cuda.empty_cache()
 
-        log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
+        # log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
             load_fsdp_model_to_gpu(self.module)
-        params = self.module.state_dict()
+            log_gpu_memory_usage("After load fsdp model in sharding manager memory", logger=logger)
+
+        if self.async_steps <= 0 or self.step <= 0:
+            params = self.module.state_dict()
+            # print(f"FSDP-VLLM state_dict is {params}")
+            print(f"FSDP-VLLM use current param")
+        else:
+            save_model_replica(self.module, f"step_{self.step}")
+            params = load_oldest_model_replica(self.module)
+            delete_model_replica(f"step_{self.step - self.async_steps}")
+            print(f"FSDP-VLLM use old param")
+            
+
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
         # Copy, not share memory
         load_format = "hf" if self.full_params else "dtensor"
@@ -112,13 +128,18 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             else:
                 self.inference_engine.wake_up()
 
+            log_gpu_memory_usage("After wake up inference engine weight in sharding manager memory", logger=logger)
+
             # update model params
             self.update_params(params)
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
             del params
+            log_gpu_memory_usage("After delete original weight in sharding manager memory", logger=logger)
             if self.offload_param:
                 offload_fsdp_model_to_cpu(self.module)
             torch.cuda.empty_cache()
+
+            # log_gpu_memory_usage("Before wake up inference engine kv cache in sharding manager memory", logger=logger)
 
             if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
                 self.inference_engine.wake_up(tags=["kv_cache"])
@@ -140,6 +161,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.inference_engine.offload_model_weights()
         else:
             self.inference_engine.sleep(level=1)
+            log_gpu_memory_usage("After sleep inference engine in sharding manager", logger=logger)
 
         self.module.train()
 

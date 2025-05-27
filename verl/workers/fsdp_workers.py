@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import time
 import warnings
 from typing import Union
 
@@ -39,6 +40,8 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.profiler import _torch_profiler
 from verl.utils.fsdp_utils import (
+    save_model_replica,
+    delete_model_replica,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -365,6 +368,7 @@ class ActorRolloutRefWorker(Worker):
                 full_params="hf" in self.config.rollout.load_format,
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
+                async_steps=self.config.async_steps
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
@@ -536,7 +540,8 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
-        with _torch_profiler(file_prefix="generate_sequences", profile_time=False) as prof:
+        start_time = time.time()
+        with _torch_profiler(file_prefix="generate_sequences") as prof:
             # Support all hardwares
             prompts = prompts.to(torch.cuda.current_device())
 
@@ -547,6 +552,15 @@ class ActorRolloutRefWorker(Worker):
                 "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
             }
             prompts.meta_info.update(meta_info)
+
+            if "step" in prompts.meta_info:
+                # train
+                self.rollout_sharding_manager.step = prompts.meta_info["step"]
+            else:
+                # val
+                self.rollout_sharding_manager.step = -1 
+            print(f"FSDP-VLLM step is {self.rollout_sharding_manager.step}")
+
             with self.rollout_sharding_manager:
                 log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
@@ -561,8 +575,12 @@ class ActorRolloutRefWorker(Worker):
             with record_function("## clear kv cache ##"):
                 torch.cuda.empty_cache()
 
+            log_gpu_memory_usage("After empty cache during generate_sequences", logger=logger)
+
             if prof is not None:
                 prof.step()
+        end_time = time.time()
+        output.meta_info["gen_time"] = end_time - start_time
 
         return output
 

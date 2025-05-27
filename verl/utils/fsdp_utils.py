@@ -27,7 +27,89 @@ from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from transformers.trainer_pt_utils import get_module_class_from_name
+
+
+# 全局变量，用于存储所有模型的副本
+_GLOBAL_REPLICAS = {}
+
+@torch.no_grad()
+def save_model_replica(model: FSDP, tag: str):  
+    FSDP.set_state_dict_type(
+        model,
+        state_dict_type=StateDictType.SHARDED_STATE_DICT,
+        state_dict_config=ShardedStateDictConfig(),
+    )
+    
+    # 获取当前模型的state_dict
+    state_dict = model.state_dict()
+    
+    # 创建包含数据和设备信息的副本
+    cpu_state_dict = {}
+    for k, v in state_dict.items():
+        original_device = v.device
+        # 将数据移动到CPU，并克隆以避免引用原数据
+        cpu_data = v.cpu() if v.is_cuda else v.clone().cpu()
+        # 保存数据和原始设备信息
+        cpu_state_dict[k] = {
+            'data': cpu_data,
+            'device': original_device
+        }
+    
+    # 保存到全局字典中
+    _GLOBAL_REPLICAS[tag] = cpu_state_dict
+
+
+@torch.no_grad()
+def load_model_replica(model: FSDP, tag: str) -> Dict:
+    # 检查副本是否存在
+    if tag not in _GLOBAL_REPLICAS:
+        raise ValueError(f"Replica with tag '{tag}' not found")
+    
+    # 获取保存的副本数据
+    saved_state_dict = _GLOBAL_REPLICAS[tag]
+    restored_state_dict = {}
+    
+    # 获取当前GPU设备
+    current_gpu = torch.device(f"cuda:{torch.cuda.current_device()}")
+    
+    for k, entry in saved_state_dict.items():
+        data = entry['data']
+        original_device = entry['device']
+        
+        # 根据原始设备决定数据存放位置
+        if original_device.type == 'cpu':
+            # 保持数据在CPU
+            restored_state_dict[k] = data
+        else:
+            # 将数据移动到当前GPU设备
+            restored_state_dict[k] = data.to(current_gpu)
+    
+    return restored_state_dict
+
+
+@torch.no_grad()
+def load_oldest_model_replica(model: FSDP) -> Dict:
+    if not _GLOBAL_REPLICAS:
+        raise ValueError("No replicas exist globally")
+    
+    # 获取所有存在的tag并按步骤排序
+    tags = list(_GLOBAL_REPLICAS.keys())
+    def extract_step(tag):
+        return int(tag.split('_')[1])
+    sorted_tags = sorted(tags, key=extract_step)
+    
+    # 获取最旧的tag
+    oldest_tag = sorted_tags[0]
+    print(f"Load checkpoint with tag {oldest_tag}")
+    return load_model_replica(model, oldest_tag)
+
+
+def delete_model_replica(tag: str):
+    # 检查指定tag是否存在
+    if tag in _GLOBAL_REPLICAS:
+        del _GLOBAL_REPLICAS[tag]
 
 
 def init_fn(x: torch.nn.Module):

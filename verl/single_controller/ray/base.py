@@ -17,6 +17,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
+from datetime import datetime
 
 import ray
 import os
@@ -44,7 +45,9 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
         args, kwargs = dispatch_fn(self, *args, **kwargs)
         output = execute_fn(method_name, *args, **kwargs)
         if blocking:
+            print(f"Before getting ray output from {method_name}, time is {datetime.now().time()}")
             output = ray.get(output)
+            print(f"After getting ray output from {method_name}, time is {datetime.now().time()}")
         output = collect_fn(self, output)
         return output
 

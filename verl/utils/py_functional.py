@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Dict
 
 
-def union_two_dict(dict1: Dict, dict2: Dict):
+def union_two_dict(dict1: Dict, dict2: Dict, overwrite: bool = False):
     """Union two dict. Will throw an error if there is an item not the same object with the same key.
 
     Args:
@@ -30,7 +30,7 @@ def union_two_dict(dict1: Dict, dict2: Dict):
 
     """
     for key, val in dict2.items():
-        if key in dict1:
+        if not overwrite and key in dict1:
             assert dict2[key] == dict1[key], f"{key} in meta_dict1 and meta_dict2 are not the same object"
         dict1[key] = val
 

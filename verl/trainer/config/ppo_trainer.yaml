@@ -121,6 +121,7 @@ actor_rollout_ref:
       temperature: 0
       n: 1
       do_sample: False # default eager for validation
+    enable_log_prob: False
 
 critic:
   rollout_n: ${actor_rollout_ref.rollout.n}
